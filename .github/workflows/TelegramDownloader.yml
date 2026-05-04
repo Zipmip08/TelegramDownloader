@@ -61,7 +61,7 @@ jobs:
           echo "download_url=$CORRECTED_URL" >> $GITHUB_OUTPUT
           echo "original_name=$FILE_NAME" >> $GITHUB_OUTPUT
 
-      - name: ⬇️ Download file
+      - name: ⬇️ Download file with duplicate check
         id: download
         run: |
           URL="${{ steps.get_link.outputs.download_url }}"
@@ -69,8 +69,30 @@ jobs:
           
           mkdir -p downloads
           
+          # Check if file already exists
+          BASE_NAME="${ORIGINAL_NAME%.*}"
+          EXT="${ORIGINAL_NAME##*.}"
+          if [[ "$EXT" == "$ORIGINAL_NAME" ]]; then
+            EXT=""
+          else
+            EXT=".$EXT"
+          fi
+          
+          FINAL_NAME="$ORIGINAL_NAME"
+          COUNTER=1
+          
+          # Keep checking and increment counter until unique name found
+          while [ -f "downloads/$FINAL_NAME" ]; do
+            FINAL_NAME="${BASE_NAME}_${COUNTER}${EXT}"
+            COUNTER=$((COUNTER + 1))
+          done
+          
+          if [ "$FINAL_NAME" != "$ORIGINAL_NAME" ]; then
+            echo "⚠️ File already exists! Renaming to: $FINAL_NAME"
+          fi
+          
           echo "═══════════════════════════════════════════════════════════════"
-          echo "⬇️ Downloading..."
+          echo "⬇️ Downloading: $FINAL_NAME"
           echo "═══════════════════════════════════════════════════════════════"
           
           curl -L --progress-bar \
@@ -80,31 +102,32 @@ jobs:
             -C - \
             -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             -H "Referer: https://telegramdownloader.net/" \
-            -o "downloads/$ORIGINAL_NAME" \
+            -o "downloads/$FINAL_NAME" \
             "$URL"
           
-          if [ ! -f "downloads/$ORIGINAL_NAME" ]; then
+          if [ ! -f "downloads/$FINAL_NAME" ]; then
             echo "❌ Download failed!"
             exit 1
           fi
           
-          SIZE=$(stat -c%s "downloads/$ORIGINAL_NAME")
+          SIZE=$(stat -c%s "downloads/$FINAL_NAME")
           
           if [ "$SIZE" -lt 1024 ]; then
             echo "❌ ERROR: Invalid file (${SIZE} bytes)"
-            rm "downloads/$ORIGINAL_NAME"
+            rm "downloads/$FINAL_NAME"
             exit 1
           fi
           
           SIZE_MB=$((SIZE / 1024 / 1024))
           echo "✅ Download complete! Size: ${SIZE_MB} MB"
           echo "file_size=$SIZE" >> $GITHUB_OUTPUT
+          echo "downloaded_name=$FINAL_NAME" >> $GITHUB_OUTPUT
 
       - name: ✂️ Split large file
         if: github.event.inputs.split_threshold_mb != '0'
         run: |
           THRESHOLD="${{ github.event.inputs.split_threshold_mb }}"
-          FILENAME="${{ steps.get_link.outputs.original_name }}"
+          FILENAME="${{ steps.download.outputs.downloaded_name }}"
           FILE_SIZE="${{ steps.download.outputs.file_size }}"
           LIMIT=$((THRESHOLD * 1024 * 1024))
           
@@ -147,30 +170,43 @@ jobs:
       - name: 📤 Upload to GitHub (Batch upload - 1 file at a time)
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"  # ✅ بدون نقطه
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           
           if [ ! -d "downloads" ] || [ -z "$(ls -A downloads 2>/dev/null)" ]; then
             echo "⚠️ No files to upload!"
             exit 1
           fi
           
-          # Get list of files
-          FILES=($(ls downloads/ | sort))
-          TOTAL=${#FILES[@]}
+          # Get list of new files only (not already in git)
+          NEW_FILES=()
+          for file in downloads/*; do
+            filename=$(basename "$file")
+            if ! git ls-files --error-unmatch "downloads/$filename" &>/dev/null; then
+              NEW_FILES+=("$filename")
+            else
+              echo "⏭️ Skipping already uploaded file: $filename"
+            fi
+          done
+          
+          TOTAL=${#NEW_FILES[@]}
+          
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "✅ No new files to upload!"
+            exit 0
+          fi
           
           echo "═══════════════════════════════════════════════════════════════"
-          echo "📦 Total files to upload: $TOTAL"
+          echo "📦 Total new files to upload: $TOTAL"
           echo "═══════════════════════════════════════════════════════════════"
           
-          # Upload ONE file at a time to avoid HTTP 500
+          # Upload ONE file at a time
           for (( i=0; i<TOTAL; i++ )); do
             echo ""
-            echo "🚀 Uploading file $((i+1)) of $TOTAL: ${FILES[$i]}"
+            echo "🚀 Uploading file $((i+1)) of $TOTAL: ${NEW_FILES[$i]}"
             
-            git add "downloads/${FILES[$i]}"
-            git commit -m "Add ${FILES[$i]} [skip ci]"
+            git add "downloads/${NEW_FILES[$i]}"
+            git commit -m "Add ${NEW_FILES[$i]} [skip ci]"
             
-            # Push with retry
             for attempt in 1 2 3; do
               if git push origin main 2>&1; then
                 echo "   ✅ Uploaded successfully"
@@ -181,7 +217,7 @@ jobs:
                   git reset --soft HEAD~1
                   sleep 5
                 else
-                  echo "   ❌ Failed to upload ${FILES[$i]}"
+                  echo "   ❌ Failed to upload ${NEW_FILES[$i]}"
                   git reset --soft HEAD~1
                 fi
               fi
@@ -192,7 +228,7 @@ jobs:
           
           echo ""
           echo "═══════════════════════════════════════════════════════════════"
-          echo "🎉 All $TOTAL files uploaded successfully!"
+          echo "🎉 All $TOTAL new files uploaded successfully!"
           echo ""
           echo "📂 Uploaded files:"
           ls -lh downloads/
